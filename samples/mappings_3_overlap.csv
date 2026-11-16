@@ -1,0 +1,3 @@
+line,temp_station_id,valid_from_utc,valid_to_utc,real_station
+L1,T200,2026-02-01T00:00:00Z,2026-03-01T00:00:00Z,Museum
+L1,T200,2026-02-15T00:00:00Z,2026-03-15T00:00:00Z,Museum Annex

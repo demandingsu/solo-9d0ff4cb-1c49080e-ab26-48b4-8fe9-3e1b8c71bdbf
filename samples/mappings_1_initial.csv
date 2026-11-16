@@ -1,0 +1,5 @@
+line,temp_station_id,valid_from_utc,valid_to_utc,real_station
+L1,T100,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Central Station
+L1,T100,2026-02-01T00:00:00Z,2026-03-01T00:00:00Z,Central Station North Gate
+L2,T100,2026-01-01T00:00:00Z,2026-04-01T00:00:00Z,Riverside
+L1,T200,2026-01-01T00:00:00Z,2026-02-15T00:00:00Z,Museum
