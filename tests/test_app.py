@@ -274,3 +274,304 @@ def test_concurrent_imports_and_consistent_reads(tmp_path, monkeypatch):
     final = service.monthly_stats()
     assert sum(i["boardings"] for i in final) == 200
     assert service.unattributed(1000, 0)["total"] == 0
+
+
+# ---------------------------------------------------------------- 可复核导入
+
+REVIEW_HEADER = b"txn_id,swipe_time_utc,line,temp_station_id\n"
+MAPPING_HEADER = (
+    b"line,temp_station_id,valid_from_utc,valid_to_utc,real_station\n"
+)
+
+
+def review_upload(client, name, body):
+    return upload(client, "/api/imports/swipes/reviewable", name, body)
+
+
+def reviews(client, **params):
+    r = client.get("/api/reviews", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def decide(client, review_id, decision):
+    return client.post(f"/api/reviews/{review_id}/decision", json={"decision": decision})
+
+
+def test_reviewable_import_conflict_goes_pending_others_imported(client):
+    """与库冲突的行待核，其余新流水立即入库，同内容跳过；统计同步提交。"""
+    m = (
+        MAPPING_HEADER
+        + b"L1,T1,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Alpha\n"
+        + b"L1,T2,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Beta\n"
+    )
+    assert upload(client, "/api/imports/mappings", "m.csv", m).status_code == 200
+    first = (
+        REVIEW_HEADER
+        + b"A1,2026-01-05T08:00:00Z,L1,T1\n"
+        + b"A2,2026-01-05T09:00:00Z,L1,T1\n"
+    )
+    assert upload(client, "/api/imports/swipes", "first.csv", first).status_code == 200
+    assert stats_map(client) == {("2026-01", "Alpha"): 2}
+
+    # A1 改内容（冲突待核），A2 同内容（跳过），A3 新流水（立即入库）
+    second = (
+        REVIEW_HEADER
+        + b"A1,2026-01-05T08:30:00Z,L1,T2\n"
+        + b"A2,2026-01-05T09:00:00Z,L1,T1\n"
+        + b"A3,2026-01-06T10:00:00Z,L1,T2\n"
+    )
+    r = review_upload(client, "second.csv", second)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["applied"] == 1
+    assert body["skipped_duplicates"] == 1
+    assert body["pending_new"] == 1 and body["pending_duplicate"] == 0
+    # 无冲突的新流水立刻计入；冲突流水仍按原值计数
+    assert stats_map(client) == {("2026-01", "Alpha"): 2, ("2026-01", "Beta"): 1}
+
+    page = reviews(client)
+    assert page["total"] == 1
+    item = page["items"][0]
+    assert item["txn_id"] == "A1" and item["status"] == "pending"
+    assert (item["base_line"], item["base_temp_station_id"]) == ("L1", "T1")
+    assert item["base_swipe_time_utc"].startswith("2026-01-05T08:00:00")
+    assert (item["new_line"], item["new_temp_station_id"]) == ("L1", "T2")
+    assert item["new_swipe_time_utc"].startswith("2026-01-05T08:30:00")
+    assert item["filename"] == "second.csv"
+    assert client.get(f"/api/reviews/{item['review_id']}").status_code == 200
+    assert client.get("/api/reviews/not-exist").status_code == 404
+
+
+def test_reviewable_import_within_file_conflict_rejected(client):
+    body = (
+        REVIEW_HEADER
+        + b"A1,2026-01-05T08:00:00Z,L1,T1\n"
+        + b"A1,2026-01-05T09:00:00Z,L1,T1\n"
+    )
+    r = review_upload(client, "dup.csv", body)
+    assert r.status_code == 409
+    assert client.get("/api/overview").json()["swipes"] == 0
+    assert reviews(client)["total"] == 0
+
+
+def test_reupload_same_base_and_content_does_not_duplicate_pending(client):
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    conflict = REVIEW_HEADER + b"A1,2026-01-05T08:30:00Z,L1,T2\n"
+    r1 = review_upload(client, "c1.csv", conflict)
+    r2 = review_upload(client, "c2.csv", conflict)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["pending_new"] == 1
+    assert r2.json()["pending_new"] == 0
+    assert r2.json()["pending_duplicate"] == 1
+    assert r2.json()["review_ids"] == r1.json()["review_ids"]
+    page = reviews(client)
+    assert page["total"] == 1
+    assert client.get("/api/overview").json()["pending_reviews"] == 1
+
+
+def test_apply_decision_recomputes_attribution(client):
+    """采用新值时按当前映射重算归站与月客流。"""
+    m = (
+        MAPPING_HEADER
+        + b"L1,T1,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Alpha\n"
+        + b"L1,T2,2026-02-01T00:00:00Z,2026-03-01T00:00:00Z,Beta\n"
+    )
+    assert upload(client, "/api/imports/mappings", "m.csv", m).status_code == 200
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    assert stats_map(client) == {("2026-01", "Alpha"): 1}
+
+    # 新值：换站且换月
+    r = review_upload(
+        client, "c.csv",
+        REVIEW_HEADER + b"A1,2026-02-05T08:00:00Z,L1,T2\n",
+    )
+    rid = r.json()["review_ids"][0]
+    assert stats_map(client) == {("2026-01", "Alpha"): 1}  # 待核未生效
+
+    d = decide(client, rid, "apply")
+    assert d.status_code == 200, d.text
+    body = d.json()
+    assert body["review"]["status"] == "applied"
+    assert body["stats_recomputed"] is True
+    assert body["swipe"]["temp_station_id"] == "T2"
+    assert stats_map(client) == {("2026-02", "Beta"): 1}
+    assert client.get("/api/transactions/unattributed").json()["total"] == 0
+
+
+def test_keep_decision_preserves_original(client):
+    m = (
+        MAPPING_HEADER
+        + b"L1,T1,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Alpha\n"
+        + b"L1,T2,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Beta\n"
+    )
+    assert upload(client, "/api/imports/mappings", "m.csv", m).status_code == 200
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    r = review_upload(
+        client, "c.csv", REVIEW_HEADER + b"A1,2026-01-05T08:30:00Z,L1,T2\n"
+    )
+    rid = r.json()["review_ids"][0]
+    d = decide(client, rid, "keep")
+    assert d.status_code == 200, d.text
+    assert d.json()["review"]["status"] == "kept"
+    assert d.json()["swipe"]["line"] == "L1"
+    assert d.json()["swipe"]["temp_station_id"] == "T1"
+    assert stats_map(client) == {("2026-01", "Alpha"): 1}
+    # 已决定过的记录不能再次决定
+    assert decide(client, rid, "apply").status_code == 409
+
+
+def test_stale_decision_invalidated_by_other_approval(client):
+    """别的审批先改了该流水：旧待核决定失效，重传后才能按现值复核。"""
+    m = (
+        MAPPING_HEADER
+        + b"L1,T1,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Alpha\n"
+        + b"L1,T2,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Beta\n"
+        + b"L1,T3,2026-01-01T00:00:00Z,2026-02-01T00:00:00Z,Gamma\n"
+    )
+    assert upload(client, "/api/imports/mappings", "m.csv", m).status_code == 200
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+
+    # 两个文件对同一流水给出不同新值 -> 两条待核，原值相同
+    r_b = review_upload(client, "b.csv", REVIEW_HEADER + b"A1,2026-01-05T09:00:00Z,L1,T2\n")
+    r_c = review_upload(client, "c.csv", REVIEW_HEADER + b"A1,2026-01-05T10:00:00Z,L1,T3\n")
+    rid_b = r_b.json()["review_ids"][0]
+    rid_c = r_c.json()["review_ids"][0]
+    assert reviews(client)["total"] == 2
+
+    # 采用 B：C 的待核立即失效
+    assert decide(client, rid_b, "apply").status_code == 200
+    c_item = client.get(f"/api/reviews/{rid_c}").json()
+    assert c_item["status"] == "superseded"
+    # 用失效记录审批 -> 409，流水保持 B，统计不变
+    before = stats_map(client)
+    stale = decide(client, rid_c, "apply")
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["status"] == "superseded"
+    assert stats_map(client) == before
+
+    # 重新上传 C 的内容 -> 以 B 为原值重新挂起，可正常采用
+    again = review_upload(client, "c-again.csv", REVIEW_HEADER + b"A1,2026-01-05T10:00:00Z,L1,T3\n")
+    assert again.json()["pending_new"] == 1
+    rid_c2 = again.json()["review_ids"][0]
+    assert rid_c2 != rid_c
+    item = client.get(f"/api/reviews/{rid_c2}").json()
+    assert item["base_temp_station_id"] == "T2" and item["new_temp_station_id"] == "T3"
+    assert decide(client, rid_c2, "apply").status_code == 200
+    assert stats_map(client) == {("2026-01", "Gamma"): 1}
+
+
+def test_approval_failure_rolls_back_swipe_and_review(client, monkeypatch):
+    """审批中途失败：流水保持原值，待核记录保持 pending，统计不变。"""
+    from app import service
+
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    r = review_upload(
+        client, "c.csv", REVIEW_HEADER + b"A1,2026-01-05T09:00:00Z,L1,T2\n"
+    )
+    rid = r.json()["review_ids"][0]
+
+    def boom(conn):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(service, "_recompute_stats", boom)
+    with pytest.raises(RuntimeError):
+        service.decide_review(rid, "apply")
+
+    item = client.get(f"/api/reviews/{rid}").json()
+    assert item["status"] == "pending"
+    swipe_row = client.get("/api/reviews", params={"txn_id": "A1", "status": "all"}).json()
+    assert swipe_row["items"][0]["new_temp_station_id"] == "T2"
+    # 流水未被改
+    import sqlite3, os
+    conn = sqlite3.connect(os.environ["TRANSIT_DB_PATH"])
+    try:
+        row = conn.execute(
+            "SELECT temp_station_id FROM swipes WHERE txn_id='A1'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "T1"
+
+
+def test_strict_import_still_rejects_conflicts(client):
+    """原有导入接口行为不变：同号不同内容仍整批拒收。"""
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    r = upload(
+        client, "/api/imports/swipes", "b.csv",
+        REVIEW_HEADER
+        + b"A1,2026-01-05T09:00:00Z,L1,T1\n"
+        + b"A2,2026-01-06T09:00:00Z,L1,T1\n",
+    )
+    assert r.status_code == 409
+    assert client.get("/api/overview").json()["swipes"] == 1
+    assert reviews(client)["total"] == 0  # 严格导入不产生待核
+
+
+def test_reupload_after_apply_does_not_create_new_pending(client):
+    """采用新值后重传同一文件：内容已一致，跳过且不再挂起。"""
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    conflict = REVIEW_HEADER + b"A1,2026-01-05T08:30:00Z,L1,T2\n"
+    r = review_upload(client, "c.csv", conflict)
+    rid = r.json()["review_ids"][0]
+    assert decide(client, rid, "apply").status_code == 200
+    assert client.get("/api/overview").json()["pending_reviews"] == 0
+
+    again = review_upload(client, "c-again.csv", conflict)
+    assert again.status_code == 200
+    assert again.json()["applied"] == 0
+    assert again.json()["pending_new"] == 0
+    assert again.json()["pending_duplicate"] == 0
+    assert again.json()["skipped_duplicates"] == 1
+    assert client.get("/api/overview").json()["pending_reviews"] == 0
+    # 已采用记录再次审批 -> 409，数据不变
+    assert decide(client, rid, "keep").status_code == 409
+
+
+def test_decision_invalid_when_swipe_changed_without_superseding(client):
+    """极端情形：待核原值已被别处改掉但记录仍 pending，审批整体回滚。"""
+    from app import service
+
+    assert upload(
+        client, "/api/imports/swipes", "a.csv",
+        REVIEW_HEADER + b"A1,2026-01-05T08:00:00Z,L1,T1\n",
+    ).status_code == 200
+    r = review_upload(
+        client, "c.csv", REVIEW_HEADER + b"A1,2026-01-05T09:00:00Z,L1,T2\n"
+    )
+    rid = r.json()["review_ids"][0]
+
+    # 绕过审批直接改库，模拟"别的途径改了原值"
+    from app import db
+
+    with db.write_txn() as conn:
+        conn.execute(
+            "UPDATE swipes SET temp_station_id = 'T9' WHERE txn_id = 'A1'"
+        )
+    with pytest.raises(service.StaleReviewError):
+        service.decide_review(rid, "apply")
+    # 审批失败：待核状态不变、流水保持 T9
+    item = client.get(f"/api/reviews/{rid}").json()
+    assert item["status"] == "pending"
+    assert client.get(f"/api/reviews/{rid}").json()["new_temp_station_id"] == "T2"

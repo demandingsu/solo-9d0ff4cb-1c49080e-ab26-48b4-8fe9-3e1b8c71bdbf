@@ -6,16 +6,17 @@ app.db.write_txn 全局串行化，读路径走 WAL 快照，互不一致性问�
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import db, service
 from .csvio import CsvError, parse_mappings, parse_swipes
-from .service import ConflictError
+from .service import ConflictError, ReviewNotFound, StaleReviewError
 
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
@@ -38,10 +39,18 @@ DESCRIPTION = """
 * 映射晚到会**重算旧流水**；导入与统计在同一事务提交，查询只见一致的已提交状态；
 * 导入失败（校验/冲突）**不改变已有结果**。
 
-## 快速体验
+## 可复核导入（补传离线流水）
 
-`/samples` 下有成组样例文件，按 README 的顺序在下方导入接口里上传即可
-演示「迟到改站重算」「幂等重传」「冲突拒收」「时段重叠拒收」。
+`POST /api/imports/swipes/reviewable` 用于数据员补传离线刷卡：
+
+* **文件内**同号异内容：仍然**整批拒收**（409）；
+* 与**库中**冲突的行：连同原值、新值留作**待核**，不阻塞同文件的其它行；
+* 其余无冲突的新流水：**立即入库**并计入统计；同号同内容：跳过；
+* 「原值 + 新值」相同重传不会重复挂起；上传刷新原值基准时，旧待核自动失效；
+* `GET /api/reviews` 查待核，`POST /api/reviews/{id}/decision` 按条选择
+  `keep`（保留原值）或 `apply`（采用新值并按当前映射重算归站与月客流）；
+* 审批、流水变更与统计重算同一事务提交；审批失败原值与待核状态不变；
+  别的审批先改了该流水时，旧待核返回 409 失效，需重新上传按现值复核。
 """
 
 
@@ -53,6 +62,53 @@ class ImportResult(BaseModel):
     applied: int
     skipped_duplicates: int
     note: str | None = None
+
+
+class ReviewableImportResult(ImportResult):
+    pending_new: int
+    pending_duplicate: int
+    superseded: int
+    review_ids: list[str]
+
+
+class ReviewItem(BaseModel):
+    review_id: str
+    txn_id: str
+    status: str
+    base_swipe_time_utc: str
+    base_line: str
+    base_temp_station_id: str
+    new_swipe_time_utc: str
+    new_line: str
+    new_temp_station_id: str
+    batch_id: str
+    filename: str
+    created_at: str
+    decided_at: str | None
+    note: str | None
+
+
+class ReviewPage(BaseModel):
+    total: int
+    items: list[ReviewItem]
+
+
+class ReviewDecision(str, Enum):
+    keep = "keep"
+    apply = "apply"
+
+
+class ReviewDecisionRequest(BaseModel):
+    decision: ReviewDecision = Field(
+        ...,
+        description="keep = 保留库中原值；apply = 采用文件里的新值（按当前映射重算归站）",
+    )
+
+
+class ReviewDecisionResult(BaseModel):
+    review: ReviewItem
+    swipe: dict | None
+    stats_recomputed: bool
 
 
 class MonthlyStat(BaseModel):
@@ -101,6 +157,8 @@ class Overview(BaseModel):
     import_batches: int
     monthly_stat_rows: int
     attributed_boardings: int
+    pending_reviews: int
+    superseded_reviews: int
 
 
 @asynccontextmanager
@@ -112,7 +170,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="公交刷卡流水归站 API",
     description=DESCRIPTION,
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -178,6 +236,47 @@ def import_swipe_file(
 
 
 @app.post(
+    "/api/imports/swipes/reviewable",
+    response_model=ReviewableImportResult,
+    tags=["导入"],
+    responses={
+        409: {"description": "同一文件内同号不同内容，整批拒收（已有数据不变）"},
+        422: {"description": "CSV 结构或内容非法，整批拒收"},
+    },
+)
+def import_swipe_file_reviewable(
+    file: UploadFile = File(..., description="刷卡流水 CSV：txn_id, swipe_time_utc, line, temp_station_id"),
+):
+    """可复核导入刷卡流水 CSV。
+
+    - 文件**内部**同号不同内容：整批拒收（409，与原导入规则一致）；
+    - 与**库中**冲突的行（同号不同内容）：不拒收，连同原值、新值留作待核；
+    - 其余无冲突的新流水：立即入库并计入统计；
+    - 同号同内容：跳过，不重复计数；
+    - 同一原值下重传同一内容：复用已挂起的待核记录，不重复挂起；
+    - 新流水、待核记录与月度统计在**同一事务**提交；
+    - 本次上传会刷新某条流水的原值基准时，该流水此前仍待核的记录自动失效。
+    """
+    try:
+        rows = parse_swipes(_read_upload(file))
+    except CsvError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "CSV 校验失败，整批拒收", "errors": e.errors},
+        )
+    try:
+        return service.import_swipes_reviewable(rows, file.filename or "upload.csv")
+    except ConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "同一文件内同号不同内容，整批拒收；已有数据未改变",
+                "conflicts": e.errors,
+            },
+        )
+
+
+@app.post(
     "/api/imports/mappings",
     response_model=ImportResult,
     tags=["导入"],
@@ -213,6 +312,66 @@ def import_mapping_file(
                 "conflicts": e.errors,
             },
         )
+
+
+# ---------------------------------------------------------------- 待核复核
+
+
+@app.get("/api/reviews", response_model=ReviewPage, tags=["复核"])
+def get_reviews(
+    status: str | None = Query(
+        default="pending",
+        pattern=r"^(pending|applied|kept|superseded|all)$",
+        description="待核状态；all 表示不过滤（默认只看 pending）",
+    ),
+    txn_id: str | None = Query(default=None, description="按流水号过滤"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    """待核记录查询：原值、新值、来源文件与状态。"""
+    return service.list_reviews(
+        None if status in (None, "all") else status, txn_id, limit, offset
+    )
+
+
+@app.get("/api/reviews/{review_id}", response_model=ReviewItem, tags=["复核"])
+def get_review(review_id: str):
+    """单条待核记录。"""
+    try:
+        return service.get_review(review_id)
+    except ReviewNotFound:
+        raise HTTPException(status_code=404, detail="待核记录不存在")
+
+
+@app.post(
+    "/api/reviews/{review_id}/decision",
+    response_model=ReviewDecisionResult,
+    tags=["复核"],
+    responses={
+        404: {"description": "待核记录不存在"},
+        409: {"description": "记录不再是待核状态，或流水原值已被别处改变（审批失败，数据不变）"},    },
+)
+def decide_review(review_id: str, body: ReviewDecisionRequest):
+    """按条决定：保留原值或采用新值。
+
+    - `keep`：保留库中原值，统计不变；
+    - `apply`：把流水改为文件新值，并按**当前映射**重算归站与月客流；
+    - 决定、流水变更、统计重算在同一事务提交；失败时原值与待核状态不变；
+    - 若别的审批先把该流水改成了别的值，本记录已失效（409），
+      需要重新上传该文件，按新的现值重新挂起才能复核。
+    """
+    try:
+        return service.decide_review(review_id, body.decision.value)
+    except ReviewNotFound:
+        raise HTTPException(status_code=404, detail="待核记录不存在")
+    except StaleReviewError as e:
+        detail = {
+            "message": "审批失败：该待核记录已失效，数据未改变；请重新上传以按现值复核",
+            "review_id": e.review_id,
+            "status": e.status,
+        }
+        detail["reason"] = "库中该流水的内容已不再是待核记录里的原值"
+        raise HTTPException(status_code=409, detail=detail)
 
 
 # ---------------------------------------------------------------- 查询

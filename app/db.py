@@ -59,6 +59,37 @@ CREATE TABLE IF NOT EXISTS monthly_stats (
     boardings    INTEGER NOT NULL,
     PRIMARY KEY (month, real_station)
 );
+
+-- 可复核导入的待核记录：保留冲突发生时的"原值"快照和文件里的"新值"
+CREATE TABLE IF NOT EXISTS swipe_reviews (
+    review_id             TEXT PRIMARY KEY,
+    txn_id                TEXT NOT NULL,
+    status                TEXT NOT NULL
+        CHECK (status IN ('pending', 'applied', 'kept', 'superseded')),
+    base_swipe_time_utc   TEXT NOT NULL,
+    base_line             TEXT NOT NULL,
+    base_temp_station_id  TEXT NOT NULL,
+    new_swipe_time_utc    TEXT NOT NULL,
+    new_line              TEXT NOT NULL,
+    new_temp_station_id   TEXT NOT NULL,
+    batch_id              TEXT NOT NULL REFERENCES import_batches (batch_id),
+    filename              TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    decided_at            TEXT,
+    note                  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_swipe_reviews_status
+    ON swipe_reviews (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_swipe_reviews_txn
+    ON swipe_reviews (txn_id);
+-- 同一原值 + 同一新内容只允许存在一条待核，重传不会重复挂起
+CREATE UNIQUE INDEX IF NOT EXISTS uq_swipe_reviews_pending
+    ON swipe_reviews (
+        txn_id,
+        base_swipe_time_utc, base_line, base_temp_station_id,
+        new_swipe_time_utc, new_line, new_temp_station_id
+    )
+    WHERE status = 'pending';
 """
 
 

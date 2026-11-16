@@ -1,0 +1,4 @@
+txn_id,swipe_time_utc,line,temp_station_id
+S001,2026-01-05T09:45:00Z,L1,T100
+S013,2026-03-25T11:00:00Z,L1,T100
+S014,2026-03-26T12:10:00Z,L2,T100

@@ -34,3 +34,15 @@ curl -s "${BASE}/api/mappings?line=L1&temp_station_id=T200" | python3 -m json.to
 step "7. 最终状态"
 curl -s "${BASE}/api/stats/monthly" | python3 -m json.tool
 curl -s "${BASE}/api/overview"; echo
+
+step "8. 可复核补传 swipes_4_reviewable.csv（S001 冲突待核，S013/S014 立即入库）"
+curl -s -F "file=@${SAMPLES}/swipes_4_reviewable.csv" "${BASE}/api/imports/swipes/reviewable"; echo
+echo "-- 待核记录（S001 原值 vs 新值）:"
+curl -s "${BASE}/api/reviews?status=pending" | python3 -m json.tool
+
+step "9. 审批第一条待核：保留原值"
+RID=$(curl -s "${BASE}/api/reviews?status=pending&txn_id=S001" | python3 -c 'import json,sys; print(json.load(sys.stdin)["items"][0]["review_id"])')
+curl -s -H 'Content-Type: application/json' -d '{"decision":"keep"}' "${BASE}/api/reviews/${RID}/decision" | python3 -m json.tool
+
+step "10. 最终状态（含待核计数）"
+curl -s "${BASE}/api/overview"; echo
